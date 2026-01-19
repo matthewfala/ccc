@@ -9,11 +9,13 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.0"
+CCC_VERSION="1.1.1"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
 CCC_CLAUDE_NODEJS_DIR="${HOME}/.ccc-nodejs-config"
+CCC_XDG_CONFIG_DIR="${HOME}/.ccc-xdg-config"
+CCC_XDG_DATA_DIR="${HOME}/.ccc-xdg-data"
 
 # Colors for output (if terminal supports it)
 if [[ -t 1 ]]; then
@@ -238,9 +240,13 @@ ENV DEVCONTAINER=true
 # Auto-accept Claude Code terms and dangerous permissions since we're in a container
 ENV CLAUDE_CODE_ACCEPT_TOS=true
 
-# Create workspace, secrets, and config directories
-RUN mkdir -p /sandbox /secrets /home/node/.claude && \
-    chown -R node:node /sandbox /secrets /home/node/.claude
+# Create workspace, secrets, and config directories (including XDG paths for persistent config)
+RUN mkdir -p /sandbox /secrets /home/node/.claude /home/node/.config /home/node/.local/share /home/node/.npm && \
+    chown -R node:node /sandbox /secrets /home/node/.claude /home/node/.config /home/node/.local /home/node/.npm
+
+# Set XDG environment variables for config persistence
+ENV XDG_CONFIG_HOME=/home/node/.config
+ENV XDG_DATA_HOME=/home/node/.local/share
 
 WORKDIR /sandbox
 
@@ -579,6 +585,10 @@ run_container() {
     # Ensure Node.js config directory exists (for npm cache and global packages)
     mkdir -p "${CCC_CLAUDE_NODEJS_DIR}"
 
+    # Ensure XDG config directories exist (for Claude Code settings persistence)
+    mkdir -p "${CCC_XDG_CONFIG_DIR}"
+    mkdir -p "${CCC_XDG_DATA_DIR}"
+
     # Ensure steering file exists at project root for Claude to read on startup
     ensure_steering_file_at_root
 
@@ -602,6 +612,8 @@ run_container() {
         -v "${secrets_dir}:/secrets"
         -v "${CCC_CLAUDE_CONFIG_DIR}:/home/node/.claude"
         -v "${CCC_CLAUDE_NODEJS_DIR}:/home/node/.npm"
+        -v "${CCC_XDG_CONFIG_DIR}:/home/node/.config"
+        -v "${CCC_XDG_DATA_DIR}:/home/node/.local/share"
         -v "/var/run/docker.sock:/var/run/docker.sock"
         -w /sandbox
     )
