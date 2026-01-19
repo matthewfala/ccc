@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+#
+# ccc - Claude Code Container
+# A tool to run Claude Code in a sandboxed Docker container
+#
+# Copyright (c) Matthew Fala. All Rights Reserved.
+#
+
+set -euo pipefail
+
+# Configuration
+CCC_VERSION="1.0.0"
+CCC_IMAGE_PREFIX="ccc-devcontainer"
+CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
+CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
+
+# Colors for output (if terminal supports it)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
+
+# Print functions
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+# Show usage
+show_usage() {
+    cat << EOF
+ccc - Claude Code Container v${CCC_VERSION}
+
+Usage: ccc [OPTIONS] [COMMAND]
+
+Run Claude Code in a sandboxed Docker container with access only to the current directory.
+
+Options:
+    -h, --help          Show this help message
+    -v, --version       Show version information
+    -b, --build         Force rebuild of the Docker image
+    -n, --no-network    Restrict network access (enable firewall)
+    --shell             Open a shell instead of Claude Code
+
+Commands:
+    init                Initialize ccc in current directory (creates /ccc folder)
+    build               Build/rebuild the Docker image
+    clean               Remove Docker image and container for current project
+    status              Show status of current project
+
+Examples:
+    ccc                 Start Claude Code in the current directory
+    ccc init            Initialize ccc configuration in current directory
+    ccc --build         Force rebuild and start Claude Code
+    ccc --shell         Open an interactive shell in the container
+
+For more information, visit: https://github.com/anthropics/claude-code
+
+EOF
+}
+
+# Get project name from current directory
+get_project_name() {
+    basename "$(pwd)"
+}
+
+# Get image name for current project
+get_image_name() {
+    local project_name
+    project_name=$(get_project_name)
+    echo "${CCC_IMAGE_PREFIX}-${project_name}"
+}
+
+# Get container name for current project
+get_container_name() {
+    local project_name
+    project_name=$(get_project_name)
+    echo "ccc-${project_name}"
+}
+
+# Check if Docker is available
+check_docker() {
+    if ! command -v docker &> /dev/null; then
+        print_error "Docker is not installed or not in PATH"
+        print_info "Please install Docker: https://docs.docker.com/get-docker/"
+        exit 1
+    fi
+
+    if ! docker info &> /dev/null; then
+        print_error "Docker daemon is not running"
+        print_info "Please start Docker and try again"
+        exit 1
+    fi
+}
+
+# Initialize ccc in current directory
+init_project() {
+    local project_name
+    project_name=$(get_project_name)
+    local ccc_dir="./ccc"
+    local secrets_dir="${CCC_SECRETS_BASE}/${project_name}"
+
+    print_info "Initializing ccc for project: ${project_name}"
+
+    # Create ccc directory
+    if [[ ! -d "${ccc_dir}" ]]; then
+        mkdir -p "${ccc_dir}"
+        print_success "Created ${ccc_dir} directory"
+    else
+        print_info "${ccc_dir} directory already exists"
+    fi
+
+    # Create Dockerfile.devcontainer if it doesn't exist
+    if [[ ! -f "${ccc_dir}/Dockerfile.devcontainer" ]]; then
+        create_default_dockerfile "${ccc_dir}/Dockerfile.devcontainer"
+        print_success "Created ${ccc_dir}/Dockerfile.devcontainer"
+    else
+        print_info "Dockerfile.devcontainer already exists"
+    fi
+
+    # Create init-firewall.sh if it doesn't exist
+    if [[ ! -f "${ccc_dir}/init-firewall.sh" ]]; then
+        create_init_firewall_script "${ccc_dir}/init-firewall.sh"
+        print_success "Created ${ccc_dir}/init-firewall.sh"
+    else
+        print_info "init-firewall.sh already exists"
+    fi
+
+    # Create steering file
+    if [[ ! -f "${ccc_dir}/CLAUDE.md" ]]; then
+        create_steering_file "${ccc_dir}/CLAUDE.md" "${project_name}"
+        print_success "Created ${ccc_dir}/CLAUDE.md steering file"
+    else
+        print_info "CLAUDE.md steering file already exists"
+    fi
+
+    # Create secrets directory on host
+    if [[ ! -d "${secrets_dir}" ]]; then
+        mkdir -p "${secrets_dir}"
+        print_success "Created secrets directory: ${secrets_dir}"
+    else
+        print_info "Secrets directory already exists: ${secrets_dir}"
+    fi
+
+    # Create .gitignore if not exists
+    if [[ ! -f "${ccc_dir}/.gitignore" ]]; then
+        cat > "${ccc_dir}/.gitignore" << 'GITIGNORE'
+# CCC local files
+*.local
+.env
+GITIGNORE
+        print_success "Created ${ccc_dir}/.gitignore"
+    fi
+
+    print_success "Project initialized! Run 'ccc' to start Claude Code in container"
+}
+
+# Create the default Dockerfile
+create_default_dockerfile() {
+    local dockerfile_path="$1"
+    cat > "${dockerfile_path}" << 'DOCKERFILE'
+FROM node:20
+
+ARG TZ
+ENV TZ="$TZ"
+
+ARG CLAUDE_CODE_VERSION=latest
+
+# Install basic development tools and iptables/ipset
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    less \
+    git \
+    procps \
+    sudo \
+    fzf \
+    zsh \
+    man-db \
+    unzip \
+    gnupg2 \
+    gh \
+    iptables \
+    ipset \
+    iproute2 \
+    dnsutils \
+    aggregate \
+    jq \
+    nano \
+    vim \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Ensure default node user has access to /usr/local/share
+RUN mkdir -p /usr/local/share/npm-global && \
+    chown -R node:node /usr/local/share
+
+ARG USERNAME=node
+
+# Persist bash history
+RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
+    && mkdir /commandhistory \
+    && touch /commandhistory/.bash_history \
+    && chown -R $USERNAME /commandhistory
+
+# Set DEVCONTAINER environment variable
+ENV DEVCONTAINER=true
+
+# Create workspace, secrets, and config directories
+RUN mkdir -p /sandbox /secrets /home/node/.claude && \
+    chown -R node:node /sandbox /secrets /home/node/.claude
+
+WORKDIR /sandbox
+
+ARG GIT_DELTA_VERSION=0.18.2
+RUN ARCH=$(dpkg --print-architecture) && \
+    wget "https://github.com/dandavison/delta/releases/download/${GIT_DELTA_VERSION}/git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
+    sudo dpkg -i "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
+    rm "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb"
+
+# Set up non-root user
+USER node
+
+# Install global packages
+ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
+ENV PATH=$PATH:/usr/local/share/npm-global/bin
+
+# Set the default shell to zsh
+ENV SHELL=/bin/zsh
+
+# Set the default editor
+ENV EDITOR=nano
+ENV VISUAL=nano
+
+# Default powerline10k theme
+ARG ZSH_IN_DOCKER_VERSION=1.2.0
+RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/v${ZSH_IN_DOCKER_VERSION}/zsh-in-docker.sh)" -- \
+    -p git \
+    -p fzf \
+    -a "source /usr/share/doc/fzf/examples/key-bindings.zsh" \
+    -a "source /usr/share/doc/fzf/examples/completion.zsh" \
+    -a "export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhistory/.bash_history" \
+    -x
+
+# Install Claude Code
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# Copy and set up firewall script
+COPY init-firewall.sh /usr/local/bin/
+USER root
+RUN chmod +x /usr/local/bin/init-firewall.sh && \
+    echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
+    chmod 0440 /etc/sudoers.d/node-firewall
+USER node
+
+# Default command
+CMD ["claude", "--dangerously-skip-permissions"]
+DOCKERFILE
+}
+
+# Create init-firewall.sh script
+create_init_firewall_script() {
+    local script_path="$1"
+    cat > "${script_path}" << 'FIREWALL_SCRIPT'
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Extract Docker DNS info BEFORE any flushing
+DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
+
+# Flush existing rules and delete existing ipsets
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t mangle -X
+ipset destroy allowed-domains 2>/dev/null || true
+
+# Restore Docker DNS resolution
+if [ -n "$DOCKER_DNS_RULES" ]; then
+    echo "Restoring Docker DNS rules..."
+    iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
+    iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
+    echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
+else
+    echo "No Docker DNS rules to restore"
+fi
+
+# Allow DNS and localhost before restrictions
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A INPUT -p udp --sport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
+iptables -A INPUT -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Create ipset with CIDR support
+ipset create allowed-domains hash:net
+
+# Fetch GitHub meta information
+echo "Fetching GitHub IP ranges..."
+gh_ranges=$(curl -s https://api.github.com/meta)
+if [ -z "$gh_ranges" ]; then
+    echo "ERROR: Failed to fetch GitHub IP ranges"
+    exit 1
+fi
+
+if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
+    echo "ERROR: GitHub API response missing required fields"
+    exit 1
+fi
+
+echo "Processing GitHub IPs..."
+while read -r cidr; do
+    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
+        exit 1
+    fi
+    echo "Adding GitHub range $cidr"
+    ipset add allowed-domains "$cidr"
+done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
+
+# Resolve and add other allowed domains
+for domain in \
+    "registry.npmjs.org" \
+    "api.anthropic.com" \
+    "sentry.io" \
+    "statsig.anthropic.com" \
+    "statsig.com" \
+    "marketplace.visualstudio.com" \
+    "vscode.blob.core.windows.net" \
+    "update.code.visualstudio.com"; do
+    echo "Resolving $domain..."
+    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
+    if [ -z "$ips" ]; then
+        echo "ERROR: Failed to resolve $domain"
+        exit 1
+    fi
+
+    while read -r ip; do
+        if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "ERROR: Invalid IP from DNS for $domain: $ip"
+            exit 1
+        fi
+        echo "Adding $ip for $domain"
+        ipset add allowed-domains "$ip"
+    done < <(echo "$ips")
+done
+
+# Get host IP from default route
+HOST_IP=$(ip route | grep default | cut -d" " -f3)
+if [ -z "$HOST_IP" ]; then
+    echo "ERROR: Failed to detect host IP"
+    exit 1
+fi
+
+HOST_NETWORK=$(echo "$HOST_IP" | sed "s/\.[0-9]*$/.0\/24/")
+echo "Host network detected as: $HOST_NETWORK"
+
+# Set up remaining iptables rules
+iptables -A INPUT -s "$HOST_NETWORK" -j ACCEPT
+iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
+
+# Set default policies to DROP
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+
+# Allow established connections
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Allow outbound traffic to allowed domains
+iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+
+# Reject other outbound traffic
+iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+
+echo "Firewall configuration complete"
+FIREWALL_SCRIPT
+    chmod +x "${script_path}"
+}
+
+# Create steering file for Claude Code
+create_steering_file() {
+    local steering_path="$1"
+    local project_name="$2"
+    cat > "${steering_path}" << STEERING
+# Claude Code Container Steering File
+
+## Container Environment
+
+You are running inside a sandboxed Docker container via **ccc** (Claude Code Container).
+Your workspace is mounted at \`/sandbox\` which corresponds to the host's project directory.
+
+## Important Guidelines
+
+### File System Restrictions
+- You can ONLY modify files within \`/sandbox\` (the mounted project directory)
+- Do NOT attempt to modify system files or directories outside \`/sandbox\`
+- All your work should be contained within the project directory
+
+### Secrets Management
+- A secrets directory is mounted at \`/secrets\` for storing sensitive data
+- Use \`/secrets\` for API keys, credentials, and other sensitive information that should NOT be committed to git
+- The secrets directory persists between container restarts
+- Location on host: \`~/Sandbox/ccc-secrets/${project_name}\`
+
+### Container OS Changes (Docker-in-Docker)
+If you need to install additional tools or make OS-level changes:
+
+1. **Edit the Dockerfile**: Modify \`/sandbox/ccc/Dockerfile.devcontainer\` to add your required packages
+2. **Document changes**: Add comments explaining why each package is needed
+3. **Rebuild**: Tell the user to run \`ccc --build\` to rebuild with your changes
+
+Example addition to Dockerfile:
+\`\`\`dockerfile
+# Install Python for data processing scripts
+RUN apt-get update && apt-get install -y python3 python3-pip
+\`\`\`
+
+### Network Access
+- By default, network access is unrestricted
+- If running with \`--no-network\`, only specific domains are accessible:
+  - api.anthropic.com
+  - github.com
+  - registry.npmjs.org
+  - And a few others for essential operations
+
+### Best Practices
+1. Keep all project files in \`/sandbox\`
+2. Store secrets in \`/secrets\`, never in the project directory
+3. Document any Dockerfile changes clearly
+4. Avoid modifying container state directly; prefer Dockerfile changes for persistence
+
+## Project Structure
+\`\`\`
+/sandbox/                    # Your project (mounted from host)
+├── ccc/
+│   ├── Dockerfile.devcontainer  # Customize your container here
+│   ├── init-firewall.sh         # Network firewall script
+│   └── CLAUDE.md                # This steering file
+├── [your project files]
+/secrets/                    # Persistent secrets storage (mounted)
+\`\`\`
+STEERING
+}
+
+# Build Docker image
+build_image() {
+    local force_build="${1:-false}"
+    local project_name
+    project_name=$(get_project_name)
+    local image_name
+    image_name=$(get_image_name)
+    local ccc_dir="./ccc"
+
+    # Check if ccc is initialized
+    if [[ ! -d "${ccc_dir}" ]]; then
+        print_warning "Project not initialized. Running init first..."
+        init_project
+    fi
+
+    # Check if image exists and we're not forcing rebuild
+    if [[ "${force_build}" != "true" ]] && docker image inspect "${image_name}" &> /dev/null; then
+        print_info "Image ${image_name} already exists. Use --build to force rebuild."
+        return 0
+    fi
+
+    print_info "Building Docker image: ${image_name}"
+
+    # Build the image
+    docker build \
+        --build-arg TZ="$(cat /etc/timezone 2>/dev/null || echo 'UTC')" \
+        -t "${image_name}" \
+        -f "${ccc_dir}/Dockerfile.devcontainer" \
+        "${ccc_dir}"
+
+    print_success "Image built successfully: ${image_name}"
+}
+
+# Run Claude Code in container
+run_container() {
+    local shell_mode="${1:-false}"
+    local no_network="${2:-false}"
+    local project_name
+    project_name=$(get_project_name)
+    local image_name
+    image_name=$(get_image_name)
+    local container_name
+    container_name=$(get_container_name)
+    local secrets_dir="${CCC_SECRETS_BASE}/${project_name}"
+
+    # Ensure image is built
+    build_image "false"
+
+    # Ensure secrets directory exists
+    mkdir -p "${secrets_dir}"
+
+    # Ensure Claude config directory exists
+    mkdir -p "${CCC_CLAUDE_CONFIG_DIR}"
+
+    print_info "Starting Claude Code Container for: ${project_name}"
+
+    # Build docker run command
+    local docker_args=(
+        run
+        --rm
+        -it
+        --name "${container_name}"
+        -v "$(pwd):/sandbox"
+        -v "${secrets_dir}:/secrets"
+        -v "${CCC_CLAUDE_CONFIG_DIR}:/home/node/.claude"
+        -w /sandbox
+    )
+
+    # Add network restrictions if requested
+    if [[ "${no_network}" == "true" ]]; then
+        docker_args+=(--cap-add=NET_ADMIN)
+        print_warning "Network restrictions enabled. Running firewall initialization..."
+    fi
+
+    # Set the command
+    if [[ "${shell_mode}" == "true" ]]; then
+        docker_args+=("${image_name}" "/bin/zsh")
+    else
+        if [[ "${no_network}" == "true" ]]; then
+            docker_args+=("${image_name}" "/bin/bash" "-c" "sudo /usr/local/bin/init-firewall.sh && claude --dangerously-skip-permissions")
+        else
+            docker_args+=("${image_name}" "claude" "--dangerously-skip-permissions")
+        fi
+    fi
+
+    # Run the container
+    docker "${docker_args[@]}"
+}
+
+# Show project status
+show_status() {
+    local project_name
+    project_name=$(get_project_name)
+    local image_name
+    image_name=$(get_image_name)
+    local container_name
+    container_name=$(get_container_name)
+    local secrets_dir="${CCC_SECRETS_BASE}/${project_name}"
+    local ccc_dir="./ccc"
+
+    echo "=== CCC Status for: ${project_name} ==="
+    echo ""
+
+    # Check initialization
+    if [[ -d "${ccc_dir}" ]]; then
+        print_success "Project initialized: ${ccc_dir}"
+    else
+        print_warning "Project not initialized. Run 'ccc init'"
+    fi
+
+    # Check Dockerfile
+    if [[ -f "${ccc_dir}/Dockerfile.devcontainer" ]]; then
+        print_success "Dockerfile exists: ${ccc_dir}/Dockerfile.devcontainer"
+    else
+        print_warning "Dockerfile missing"
+    fi
+
+    # Check Docker image
+    if docker image inspect "${image_name}" &> /dev/null; then
+        local image_size
+        image_size=$(docker image inspect "${image_name}" --format='{{.Size}}' | numfmt --to=iec 2>/dev/null || echo "unknown")
+        print_success "Docker image exists: ${image_name} (${image_size})"
+    else
+        print_warning "Docker image not built: ${image_name}"
+    fi
+
+    # Check if container is running
+    if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+        print_success "Container running: ${container_name}"
+    else
+        print_info "Container not running: ${container_name}"
+    fi
+
+    # Check secrets directory
+    if [[ -d "${secrets_dir}" ]]; then
+        local secret_count
+        secret_count=$(find "${secrets_dir}" -type f 2>/dev/null | wc -l | tr -d ' ')
+        print_success "Secrets directory: ${secrets_dir} (${secret_count} files)"
+    else
+        print_info "Secrets directory not created: ${secrets_dir}"
+    fi
+
+    echo ""
+}
+
+# Clean up project resources
+clean_project() {
+    local project_name
+    project_name=$(get_project_name)
+    local image_name
+    image_name=$(get_image_name)
+    local container_name
+    container_name=$(get_container_name)
+
+    print_info "Cleaning up resources for: ${project_name}"
+
+    # Stop container if running
+    if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+        print_info "Stopping container: ${container_name}"
+        docker stop "${container_name}"
+    fi
+
+    # Remove image if exists
+    if docker image inspect "${image_name}" &> /dev/null; then
+        print_info "Removing image: ${image_name}"
+        docker rmi "${image_name}"
+        print_success "Image removed"
+    else
+        print_info "Image not found: ${image_name}"
+    fi
+
+    print_success "Cleanup complete"
+}
+
+# Main function
+main() {
+    local force_build=false
+    local shell_mode=false
+    local no_network=false
+    local command=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "ccc version ${CCC_VERSION}"
+                exit 0
+                ;;
+            -b|--build)
+                force_build=true
+                shift
+                ;;
+            -n|--no-network)
+                no_network=true
+                shift
+                ;;
+            --shell)
+                shell_mode=true
+                shift
+                ;;
+            init|build|clean|status)
+                command="$1"
+                shift
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Check Docker availability
+    check_docker
+
+    # Execute command
+    case "${command}" in
+        init)
+            init_project
+            ;;
+        build)
+            build_image "true"
+            ;;
+        clean)
+            clean_project
+            ;;
+        status)
+            show_status
+            ;;
+        "")
+            # Default: run container
+            if [[ "${force_build}" == "true" ]]; then
+                build_image "true"
+            fi
+            run_container "${shell_mode}" "${no_network}"
+            ;;
+    esac
+}
+
+# Run main
+main "$@"
