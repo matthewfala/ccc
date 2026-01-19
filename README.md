@@ -1,5 +1,7 @@
 # CCC - Claude Code Container
 
+**Version 1.1.0**
+
 A tool to run Claude Code in a sandboxed Docker container, restricting its access to only the current project directory.
 
 ## Overview
@@ -10,6 +12,8 @@ CCC (Claude Code Container) provides a secure way to use Claude Code by:
 - **Persistent Authentication**: Maintains Claude Code sign-in across sessions
 - **Secrets Management**: Provides a separate mounted directory for sensitive data that shouldn't be committed to git
 - **Customizable Environment**: Allows Claude Code to customize its container environment via Dockerfile modifications
+- **Docker-in-Docker**: Claude Code can rebuild the container from within using the mounted Docker socket
+- **Auto-confirm Permissions**: Dangerous permissions are automatically accepted since you're running in a sandbox
 
 ## Requirements
 
@@ -138,21 +142,25 @@ Additionally, on your host machine:
 | Current directory | `/sandbox` | Your project files |
 | `~/Sandbox/ccc-secrets/<project>` | `/secrets` | Persistent secrets |
 | `~/.ccc-claude-config` | `/home/node/.claude` | Claude authentication |
+| `~/.ccc-nodejs-config` | `/home/node/.npm` | NPM cache |
+| `/var/run/docker.sock` | `/var/run/docker.sock` | Docker-in-Docker |
 
 ## Customizing the Container
 
-Claude Code can customize its environment by modifying the Dockerfile:
+Claude Code can automatically customize its environment by modifying the Dockerfile and rebuilding from within the container:
 
-1. Edit `/sandbox/ccc/Dockerfile.devcontainer` in the container
-2. Add required packages (e.g., Python, Ruby, additional tools)
-3. Exit the container
-4. Run `ccc --build` to rebuild with changes
+1. Claude Code edits `/sandbox/ccc/Dockerfile.devcontainer` in the container
+2. Claude Code rebuilds using Docker-in-Docker: `docker build -t ccc-devcontainer-<project> -f Dockerfile.devcontainer .`
+3. If the build fails, Claude Code fixes the Dockerfile and retries
+
+**Note:** This happens automatically! When Claude Code installs software, it should persist those changes to the Dockerfile and rebuild without asking.
 
 ### Example: Adding Python
 
 ```dockerfile
 # Add to Dockerfile.devcontainer
-RUN apt-get update && apt-get install -y python3 python3-pip
+RUN apt-get update && apt-get install -y python3 python3-pip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 ```
 
 ## Secrets Management

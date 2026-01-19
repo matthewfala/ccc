@@ -9,10 +9,11 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.0.0"
+CCC_VERSION="1.1.0"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
+CCC_CLAUDE_NODEJS_DIR="${HOME}/.ccc-nodejs-config"
 
 # Colors for output (if terminal supports it)
 if [[ -t 1 ]]; then
@@ -186,7 +187,7 @@ ENV TZ="$TZ"
 
 ARG CLAUDE_CODE_VERSION=latest
 
-# Install basic development tools and iptables/ipset
+# Install basic development tools, iptables/ipset, and Docker CLI for Docker-in-Docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     git \
@@ -206,7 +207,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     nano \
     vim \
+    ca-certificates \
+    curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CLI for Docker-in-Docker support
+RUN install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
 RUN mkdir -p /usr/local/share/npm-global && \
@@ -222,6 +234,9 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
 
 # Set DEVCONTAINER environment variable
 ENV DEVCONTAINER=true
+
+# Auto-accept Claude Code terms and dangerous permissions since we're in a container
+ENV CLAUDE_CODE_ACCEPT_TOS=true
 
 # Create workspace, secrets, and config directories
 RUN mkdir -p /sandbox /secrets /home/node/.claude && \
@@ -425,18 +440,28 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 - The secrets directory persists between container restarts
 - Location on host: \`~/Sandbox/ccc-secrets/${project_name}\`
 
-### Container OS Changes (Docker-in-Docker)
-If you need to install additional tools or make OS-level changes:
+### Container OS Changes (Docker-in-Docker) - AUTOMATIC PERSISTENCE
 
-1. **Edit the Dockerfile**: Modify \`/sandbox/ccc/Dockerfile.devcontainer\` to add your required packages
+**IMPORTANT**: When you install any software or tools that need to persist across container restarts, you MUST:
+
+1. **Automatically edit the Dockerfile**: Modify \`/sandbox/ccc/Dockerfile.devcontainer\` to add the required packages
 2. **Document changes**: Add comments explaining why each package is needed
-3. **Rebuild**: Tell the user to run \`ccc --build\` to rebuild with your changes
+3. **Rebuild from within the container**: Use Docker-in-Docker to rebuild the image:
+   \`\`\`bash
+   cd /sandbox/ccc && docker build -t ccc-devcontainer-\$(basename /sandbox) -f Dockerfile.devcontainer .
+   \`\`\`
+4. **If the build fails**: Fix the Dockerfile and try rebuilding again until successful
+
+**This decision to persist software should be made AUTOMATICALLY by you. Do NOT ask the user if they want to persist - just do it.**
 
 Example addition to Dockerfile:
 \`\`\`dockerfile
 # Install Python for data processing scripts
-RUN apt-get update && apt-get install -y python3 python3-pip
+RUN apt-get update && apt-get install -y python3 python3-pip && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 \`\`\`
+
+Docker is available inside this container via Docker-in-Docker. You have access to the host's Docker daemon through the mounted socket.
 
 ### Network Access
 - By default, network access is unrestricted
@@ -463,6 +488,38 @@ RUN apt-get update && apt-get install -y python3 python3-pip
 /secrets/                    # Persistent secrets storage (mounted)
 \`\`\`
 STEERING
+}
+
+# Ensure steering file exists at project root for Claude to read
+ensure_steering_file_at_root() {
+    local project_name
+    project_name=$(get_project_name)
+    local ccc_dir="./ccc"
+    local root_steering_file="./CLAUDE.md"
+    local ccc_steering_file="${ccc_dir}/CLAUDE.md"
+
+    # If CCC steering file doesn't exist, create it
+    if [[ ! -f "${ccc_steering_file}" ]]; then
+        mkdir -p "${ccc_dir}"
+        create_steering_file "${ccc_steering_file}" "${project_name}"
+    fi
+
+    # Create/update symlink or copy at project root if it doesn't exist or is outdated
+    if [[ ! -f "${root_steering_file}" ]]; then
+        # Create symlink to ccc steering file at project root
+        ln -sf "ccc/CLAUDE.md" "${root_steering_file}"
+        print_info "Created steering file symlink at project root: ${root_steering_file}"
+    elif [[ -L "${root_steering_file}" ]]; then
+        # It's already a symlink, verify it points to our file
+        local target
+        target=$(readlink "${root_steering_file}" 2>/dev/null || echo "")
+        if [[ "${target}" != "ccc/CLAUDE.md" ]]; then
+            print_warning "CLAUDE.md exists but points elsewhere. Steering file in ccc/CLAUDE.md available."
+        fi
+    else
+        # It's a regular file, don't overwrite - just inform
+        print_info "Project has custom CLAUDE.md. Container steering available in ccc/CLAUDE.md"
+    fi
 }
 
 # Build Docker image
@@ -519,6 +576,20 @@ run_container() {
     # Ensure Claude config directory exists
     mkdir -p "${CCC_CLAUDE_CONFIG_DIR}"
 
+    # Ensure Node.js config directory exists (for npm cache and global packages)
+    mkdir -p "${CCC_CLAUDE_NODEJS_DIR}"
+
+    # Ensure steering file exists at project root for Claude to read on startup
+    ensure_steering_file_at_root
+
+    # Display version on startup
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}       ${GREEN}Claude Code Container (ccc) v${CCC_VERSION}${NC}               ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}       Project: ${YELLOW}${project_name}${NC}                              ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
     print_info "Starting Claude Code Container for: ${project_name}"
 
     # Build docker run command
@@ -530,8 +601,19 @@ run_container() {
         -v "$(pwd):/sandbox"
         -v "${secrets_dir}:/secrets"
         -v "${CCC_CLAUDE_CONFIG_DIR}:/home/node/.claude"
+        -v "${CCC_CLAUDE_NODEJS_DIR}:/home/node/.npm"
+        -v "/var/run/docker.sock:/var/run/docker.sock"
         -w /sandbox
     )
+
+    # Add node user to docker group by setting group ID of docker socket
+    if [[ -S "/var/run/docker.sock" ]]; then
+        local docker_gid
+        docker_gid=$(stat -f '%g' /var/run/docker.sock 2>/dev/null || stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "")
+        if [[ -n "${docker_gid}" ]]; then
+            docker_args+=(--group-add "${docker_gid}")
+        fi
+    fi
 
     # Add network restrictions if requested
     if [[ "${no_network}" == "true" ]]; then
