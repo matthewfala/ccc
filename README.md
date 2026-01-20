@@ -1,6 +1,6 @@
 # CCC - Claude Code Container
 
-**Version 1.1.7**
+**Version 1.1.8**
 
 A tool to run Claude Code in a sandboxed Docker container, restricting its access to only the current project directory.
 
@@ -123,16 +123,21 @@ your-project/
 ├── ccc/
 │   ├── Dockerfile.devcontainer   # Customize your container here
 │   ├── init-firewall.sh          # Network firewall script
+│   ├── entrypoint.sh             # Container initialization script
 │   ├── CLAUDE.md                 # Steering file for Claude Code
 │   └── .gitignore                # Ignores local files
 ├── [your project files]
 ```
 
-Additionally, on your host machine:
+Additionally, on your host machine (all project data is isolated per-project):
 
 ```
-~/Sandbox/ccc-secrets/<project-name>/   # Persistent secrets storage
-~/.ccc-claude-config/                    # Claude Code authentication
+~/.ccc/<project-name>/
+├── claude/              # Claude Code authentication & settings
+├── xdg-config/          # XDG config directory
+├── xdg-data/            # XDG data directory
+├── claude.json          # Theme and preferences
+└── sandbox-secrets/     # Persistent secrets storage
 ```
 
 ## Container Mounts
@@ -140,13 +145,14 @@ Additionally, on your host machine:
 | Host Path | Container Path | Purpose |
 |-----------|----------------|---------|
 | Current directory | `/sandbox` | Your project files |
-| `~/Sandbox/ccc-secrets/<project>` | `/secrets` | Persistent secrets |
-| `~/.ccc-claude-config` | `/home/node/.claude` | Claude authentication |
-| `~/.ccc-nodejs-config` | `/home/node/.npm` | NPM cache |
-| `~/.ccc-xdg-config` | `/home/node/.config` | XDG config (Claude Code settings) |
-| `~/.ccc-xdg-data` | `/home/node/.local/share` | XDG data (Claude Code data) |
-| `~/.ccc-claude.json` | `/home/node/.claude.json` | Theme and preferences |
+| `~/.ccc/<project>/sandbox-secrets` | `/secrets` | Persistent secrets |
+| `~/.ccc/<project>/claude` | `/home/node/.claude` | Claude authentication & settings |
+| `~/.ccc/<project>/xdg-config` | `/home/node/.config` | XDG config directory |
+| `~/.ccc/<project>/xdg-data` | `/home/node/.local/share` | XDG data directory |
+| `~/.ccc/<project>/claude.json` | `/home/node/.claude.json` | Theme and preferences |
 | `/var/run/docker.sock` | `/var/run/docker.sock` | Docker-in-Docker |
+
+**Note:** All persistence data is now project-specific, allowing multiple projects to have independent configurations.
 
 ## Customizing the Container
 
@@ -225,6 +231,22 @@ ccc --build
 
 Ensure you're running `ccc` from within your project directory. The current directory is mounted as `/sandbox`.
 
+### Upgrading from v1.1.7 or earlier
+
+If you're upgrading from an older version, your data will be automatically migrated from the old global paths to the new project-specific paths. If you have issues:
+
+```bash
+# Force rebuild the container to get the latest entrypoint
+ccc --build
+```
+
+After verifying everything works, you can delete the old directories:
+- `~/.ccc-claude-config`
+- `~/.ccc-xdg-config`
+- `~/.ccc-xdg-data`
+- `~/.ccc-claude.json`
+- `~/Sandbox/ccc-secrets/<project>`
+
 ## Security Considerations
 
 - Claude Code runs with `--dangerously-skip-permissions` inside the container
@@ -233,12 +255,24 @@ Ensure you're running `ccc` from within your project directory. The current dire
 - Secrets are stored separately from project files
 - The container runs as non-root user `node`
 
+## First-Time Setup
+
+On first run, you'll need to authenticate Claude Code:
+
+1. Start the container: `ccc`
+2. When prompted with "Invalid API key", run `/login` inside the container
+3. Follow the authentication flow in your browser
+4. Your credentials will be saved to `~/.ccc/<project>/claude/` for future sessions
+
+Each project maintains its own authentication, so you may need to authenticate once per project.
+
 ## How It Works
 
 1. **Initialization**: Creates a `ccc/` folder with Dockerfile and configuration
 2. **Build**: Builds a Docker image with Claude Code pre-installed
 3. **Run**: Starts a container with your project mounted at `/sandbox`
-4. **Authentication**: Persists Claude Code login in `~/.ccc-claude-config`
+4. **Authentication**: Persists Claude Code login in `~/.ccc/<project>/claude/`
+5. **Migration**: Automatically migrates data from older ccc versions (v1.1.7 and earlier)
 
 ## Credits
 
