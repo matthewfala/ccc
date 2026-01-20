@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.5"
+CCC_VERSION="1.1.6"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
@@ -455,6 +455,21 @@ chown -R node:node /home/node/.npm 2>/dev/null || true
 # Ensure the directories exist with correct permissions
 mkdir -p /home/node/.claude /home/node/.config /home/node/.local/share /home/node/.npm
 chown -R node:node /home/node/.claude /home/node/.config /home/node/.local /home/node/.npm
+
+# Create default settings.json if it doesn't exist (for container environment)
+if [ ! -f /home/node/.claude/settings.json ]; then
+    cat > /home/node/.claude/settings.json << 'SETTINGS'
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "env": {
+    "CLAUDE_CODE_ACCEPT_TOS": "1"
+  }
+}
+SETTINGS
+    chown node:node /home/node/.claude/settings.json
+fi
 
 # Switch to node user and execute the command
 exec gosu node "$@"
