@@ -595,7 +595,6 @@ build_image() {
         # Ensure all required files exist (handles upgrades from older versions)
         ensure_ccc_files
     fi
-    fi
 
     # Check if image exists and we're not forcing rebuild
     if [[ "${force_build}" != "true" ]] && docker image inspect "${image_name}" &> /dev/null; then
