@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.1"
+CCC_VERSION="1.1.2"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
@@ -288,7 +288,9 @@ COPY init-firewall.sh /usr/local/bin/
 USER root
 RUN chmod +x /usr/local/bin/init-firewall.sh && \
     echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
-    chmod 0440 /etc/sudoers.d/node-firewall
+    echo "node ALL=(root) NOPASSWD: /usr/bin/docker, /usr/bin/docker-buildx" > /etc/sudoers.d/node-docker && \
+    chmod 0440 /etc/sudoers.d/node-firewall && \
+    chmod 0440 /etc/sudoers.d/node-docker
 USER node
 
 # Default command
@@ -454,7 +456,7 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 2. **Document changes**: Add comments explaining why each package is needed
 3. **Rebuild from within the container**: Use Docker-in-Docker to rebuild the image:
    \`\`\`bash
-   cd /sandbox/ccc && docker build -t ccc-devcontainer-\$(basename /sandbox) -f Dockerfile.devcontainer .
+   cd /sandbox/ccc && sudo docker build -t ccc-devcontainer-\$(basename /sandbox) -f Dockerfile.devcontainer .
    \`\`\`
 4. **If the build fails**: Fix the Dockerfile and try rebuilding again until successful
 
@@ -467,7 +469,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip && \\
     apt-get clean && rm -rf /var/lib/apt/lists/*
 \`\`\`
 
-Docker is available inside this container via Docker-in-Docker. You have access to the host's Docker daemon through the mounted socket.
+Docker is available inside this container via Docker-in-Docker. Use \`sudo docker\` for all docker commands (passwordless sudo is configured).
 
 ### Network Access
 - By default, network access is unrestricted
