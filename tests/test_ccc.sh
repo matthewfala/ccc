@@ -222,7 +222,7 @@ test_init_creates_secrets_directory() {
     setup
     "${CCC_BIN}" init &> /dev/null || true
 
-    local secrets_dir="${HOME}/Sandbox/ccc-secrets/test-project"
+    local secrets_dir="${HOME}/.ccc/test-project/sandbox-secrets"
     if [[ -d "${secrets_dir}" ]]; then
         pass "Init creates secrets directory"
     else

@@ -9,14 +9,9 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.7"
+CCC_VERSION="1.1.8"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
-CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
-CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
-CCC_CLAUDE_NODEJS_DIR="${HOME}/.ccc-nodejs-config"
-CCC_XDG_CONFIG_DIR="${HOME}/.ccc-xdg-config"
-CCC_XDG_DATA_DIR="${HOME}/.ccc-xdg-data"
-CCC_CLAUDE_JSON_FILE="${HOME}/.ccc-claude.json"
+CCC_BASE_DIR="${HOME}/.ccc"
 
 # Colors for output (if terminal supports it)
 if [[ -t 1 ]]; then
@@ -102,6 +97,22 @@ get_container_name() {
     echo "ccc-${project_name}"
 }
 
+# Get project-specific paths for persistence
+# All project data is now stored under ~/.ccc/<project>/
+get_project_paths() {
+    local project_name
+    project_name=$(get_project_name)
+    local project_dir="${CCC_BASE_DIR}/${project_name}"
+
+    # Export all paths for use by calling function
+    CCC_PROJECT_DIR="${project_dir}"
+    CCC_CLAUDE_CONFIG_DIR="${project_dir}/claude"
+    CCC_XDG_CONFIG_DIR="${project_dir}/xdg-config"
+    CCC_XDG_DATA_DIR="${project_dir}/xdg-data"
+    CCC_CLAUDE_JSON_FILE="${project_dir}/claude.json"
+    CCC_SECRETS_DIR="${project_dir}/sandbox-secrets"
+}
+
 # Check if Docker is available
 check_docker() {
     if ! command -v docker &> /dev/null; then
@@ -122,7 +133,9 @@ init_project() {
     local project_name
     project_name=$(get_project_name)
     local ccc_dir="./ccc"
-    local secrets_dir="${CCC_SECRETS_BASE}/${project_name}"
+
+    # Get project-specific paths
+    get_project_paths
 
     print_info "Initializing ccc for project: ${project_name}"
 
@@ -166,12 +179,20 @@ init_project() {
         print_info "CLAUDE.md steering file already exists"
     fi
 
-    # Create secrets directory on host
-    if [[ ! -d "${secrets_dir}" ]]; then
-        mkdir -p "${secrets_dir}"
-        print_success "Created secrets directory: ${secrets_dir}"
+    # Create project persistence directory on host (includes secrets)
+    if [[ ! -d "${CCC_PROJECT_DIR}" ]]; then
+        mkdir -p "${CCC_PROJECT_DIR}"
+        print_success "Created project directory: ${CCC_PROJECT_DIR}"
     else
-        print_info "Secrets directory already exists: ${secrets_dir}"
+        print_info "Project directory already exists: ${CCC_PROJECT_DIR}"
+    fi
+
+    # Create secrets directory on host
+    if [[ ! -d "${CCC_SECRETS_DIR}" ]]; then
+        mkdir -p "${CCC_SECRETS_DIR}"
+        print_success "Created secrets directory: ${CCC_SECRETS_DIR}"
+    else
+        print_info "Secrets directory already exists: ${CCC_SECRETS_DIR}"
     fi
 
     # Create .gitignore if not exists
@@ -448,15 +469,15 @@ if [ -S /var/run/docker.sock ]; then
 fi
 
 # Fix ownership of mounted config directories so node user can write to them
+# Note: .npm is NOT mounted - only Claude-related data is persisted
 chown -R node:node /home/node/.claude 2>/dev/null || true
 chown -R node:node /home/node/.config 2>/dev/null || true
 chown -R node:node /home/node/.local 2>/dev/null || true
-chown -R node:node /home/node/.npm 2>/dev/null || true
 chown node:node /home/node/.claude.json 2>/dev/null || true
 
 # Ensure the directories exist with correct permissions
-mkdir -p /home/node/.claude /home/node/.config /home/node/.local/share /home/node/.npm
-chown -R node:node /home/node/.claude /home/node/.config /home/node/.local /home/node/.npm
+mkdir -p /home/node/.claude /home/node/.config /home/node/.local/share
+chown -R node:node /home/node/.claude /home/node/.config /home/node/.local
 
 # Create default settings.json if it doesn't exist (for container environment)
 if [ ! -f /home/node/.claude/settings.json ]; then
@@ -513,7 +534,7 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 - A secrets directory is mounted at \`/secrets\` for storing sensitive data
 - Use \`/secrets\` for API keys, credentials, and other sensitive information that should NOT be committed to git
 - The secrets directory persists between container restarts
-- Location on host: \`~/Sandbox/ccc-secrets/${project_name}\`
+- Location on host: \`~/.ccc/${project_name}/sandbox-secrets\`
 
 ### Container OS Changes (Docker-in-Docker) - AUTOMATIC PERSISTENCE
 
@@ -523,7 +544,7 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 2. **Document changes**: Add comments explaining why each package is needed
 3. **Rebuild from within the container**: Use Docker-in-Docker to rebuild the image:
    \`\`\`bash
-   cd /sandbox/ccc && docker build -t ccc-devcontainer-\$(basename /sandbox) -f Dockerfile.devcontainer .
+   cd /sandbox/ccc && docker build -t ${CCC_IMAGE_PREFIX}-${project_name} -f Dockerfile.devcontainer .
    \`\`\`
 4. **If the build fails**: Fix the Dockerfile and try rebuilding again until successful
 
@@ -659,19 +680,21 @@ run_container() {
     image_name=$(get_image_name)
     local container_name
     container_name=$(get_container_name)
-    local secrets_dir="${CCC_SECRETS_BASE}/${project_name}"
+
+    # Get project-specific paths
+    get_project_paths
 
     # Ensure image is built
     build_image "false"
 
+    # Ensure project directory exists
+    mkdir -p "${CCC_PROJECT_DIR}"
+
     # Ensure secrets directory exists
-    mkdir -p "${secrets_dir}"
+    mkdir -p "${CCC_SECRETS_DIR}"
 
     # Ensure Claude config directory exists
     mkdir -p "${CCC_CLAUDE_CONFIG_DIR}"
-
-    # Ensure Node.js config directory exists (for npm cache and global packages)
-    mkdir -p "${CCC_CLAUDE_NODEJS_DIR}"
 
     # Ensure XDG config directories exist (for Claude Code settings persistence)
     mkdir -p "${CCC_XDG_CONFIG_DIR}"
@@ -696,15 +719,15 @@ run_container() {
     print_info "Starting Claude Code Container for: ${project_name}"
 
     # Build docker run command
+    # Note: Node.js config (.npm) is NOT persisted - only Claude-related data
     local docker_args=(
         run
         --rm
         -it
         --name "${container_name}"
         -v "$(pwd):/sandbox"
-        -v "${secrets_dir}:/secrets"
+        -v "${CCC_SECRETS_DIR}:/secrets"
         -v "${CCC_CLAUDE_CONFIG_DIR}:/home/node/.claude"
-        -v "${CCC_CLAUDE_NODEJS_DIR}:/home/node/.npm"
         -v "${CCC_XDG_CONFIG_DIR}:/home/node/.config"
         -v "${CCC_XDG_DATA_DIR}:/home/node/.local/share"
         -v "${CCC_CLAUDE_JSON_FILE}:/home/node/.claude.json"
@@ -750,8 +773,10 @@ show_status() {
     image_name=$(get_image_name)
     local container_name
     container_name=$(get_container_name)
-    local secrets_dir="${CCC_SECRETS_BASE}/${project_name}"
     local ccc_dir="./ccc"
+
+    # Get project-specific paths
+    get_project_paths
 
     echo "=== CCC Status for: ${project_name} ==="
     echo ""
@@ -786,13 +811,20 @@ show_status() {
         print_info "Container not running: ${container_name}"
     fi
 
-    # Check secrets directory
-    if [[ -d "${secrets_dir}" ]]; then
-        local secret_count
-        secret_count=$(find "${secrets_dir}" -type f 2>/dev/null | wc -l | tr -d ' ')
-        print_success "Secrets directory: ${secrets_dir} (${secret_count} files)"
+    # Check project persistence directory
+    if [[ -d "${CCC_PROJECT_DIR}" ]]; then
+        print_success "Project data directory: ${CCC_PROJECT_DIR}"
     else
-        print_info "Secrets directory not created: ${secrets_dir}"
+        print_info "Project data directory not created: ${CCC_PROJECT_DIR}"
+    fi
+
+    # Check secrets directory
+    if [[ -d "${CCC_SECRETS_DIR}" ]]; then
+        local secret_count
+        secret_count=$(find "${CCC_SECRETS_DIR}" -type f 2>/dev/null | wc -l | tr -d ' ')
+        print_success "Secrets directory: ${CCC_SECRETS_DIR} (${secret_count} files)"
+    else
+        print_info "Secrets directory not created: ${CCC_SECRETS_DIR}"
     fi
 
     echo ""

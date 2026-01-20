@@ -7,6 +7,9 @@
 #
 # Usage: ./tests/test_persistence.sh
 #
+# Note: This test suite builds a Docker image once and reuses it for all tests
+# to speed up test execution.
+#
 
 set -euo pipefail
 
@@ -18,6 +21,8 @@ TEST_DIR=""
 TESTS_PASSED=0
 TESTS_FAILED=0
 TESTS_SKIPPED=0
+# Shared image for all container tests (built once)
+SHARED_TEST_IMAGE=""
 
 # Colors
 RED='\033[0;31m'
@@ -77,6 +82,32 @@ check_docker_available() {
 # Get the image name for current test project
 get_image_name() {
     echo "ccc-devcontainer-test-project"
+}
+
+# Build shared test image once for all container tests
+build_shared_test_image() {
+    if [[ -n "${SHARED_TEST_IMAGE}" ]]; then
+        return 0  # Already built
+    fi
+
+    setup
+    "${CCC_BIN}" init &> /dev/null || true
+    if "${CCC_BIN}" build &> /dev/null; then
+        SHARED_TEST_IMAGE=$(get_image_name)
+        # Don't teardown - we need the test dir for subsequent tests
+        return 0
+    else
+        teardown
+        return 1
+    fi
+}
+
+# Cleanup shared test image at end
+cleanup_shared_test_image() {
+    if [[ -n "${SHARED_TEST_IMAGE}" ]]; then
+        docker rmi "${SHARED_TEST_IMAGE}" &> /dev/null || true
+        SHARED_TEST_IMAGE=""
+    fi
 }
 
 # Test: Init creates entrypoint.sh
@@ -167,17 +198,18 @@ test_config_directories_created() {
     setup
     "${CCC_BIN}" init &> /dev/null || true
 
-    # Simulate what run_container does
-    mkdir -p "${HOME}/.ccc-claude-config"
-    mkdir -p "${HOME}/.ccc-nodejs-config"
-    mkdir -p "${HOME}/.ccc-xdg-config"
-    mkdir -p "${HOME}/.ccc-xdg-data"
+    # Simulate what run_container does with new path structure
+    local project_dir="${HOME}/.ccc/test-project"
+    mkdir -p "${project_dir}/claude"
+    mkdir -p "${project_dir}/xdg-config"
+    mkdir -p "${project_dir}/xdg-data"
+    mkdir -p "${project_dir}/sandbox-secrets"
 
     local all_exist=true
-    [[ -d "${HOME}/.ccc-claude-config" ]] || all_exist=false
-    [[ -d "${HOME}/.ccc-nodejs-config" ]] || all_exist=false
-    [[ -d "${HOME}/.ccc-xdg-config" ]] || all_exist=false
-    [[ -d "${HOME}/.ccc-xdg-data" ]] || all_exist=false
+    [[ -d "${project_dir}/claude" ]] || all_exist=false
+    [[ -d "${project_dir}/xdg-config" ]] || all_exist=false
+    [[ -d "${project_dir}/xdg-data" ]] || all_exist=false
+    [[ -d "${project_dir}/sandbox-secrets" ]] || all_exist=false
 
     if [[ "${all_exist}" == "true" ]]; then
         pass "All config directories can be created"
@@ -187,25 +219,20 @@ test_config_directories_created() {
     teardown
 }
 
-# Test: Build image successfully
+# Test: Build image successfully (this also sets up shared image for subsequent tests)
 test_build_image() {
     if ! check_docker_available; then
         skip "Build image (Docker not available)"
         return
     fi
 
-    setup
     info "Building test container (this may take a few minutes)..."
 
-    if "${CCC_BIN}" build &> /dev/null; then
+    if build_shared_test_image; then
         pass "Container image builds successfully"
     else
         fail "Container image build failed"
     fi
-
-    # Clean up image
-    docker rmi "$(get_image_name)" &> /dev/null || true
-    teardown
 }
 
 # Test: Configuration persists across container runs
@@ -215,17 +242,17 @@ test_config_persistence() {
         return
     fi
 
-    setup
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip "Configuration persistence (shared image not built)"
+        return
+    fi
+
     info "Testing configuration persistence..."
 
-    # Initialize and build
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
-
-    local image_name
-    image_name=$(get_image_name)
-    local config_dir="${HOME}/.ccc-claude-config"
-    local xdg_config_dir="${HOME}/.ccc-xdg-config"
+    # Use new path structure
+    local project_dir="${HOME}/.ccc/test-project"
+    local config_dir="${project_dir}/claude"
+    local xdg_config_dir="${project_dir}/xdg-config"
 
     mkdir -p "${config_dir}"
     mkdir -p "${xdg_config_dir}"
@@ -235,7 +262,7 @@ test_config_persistence() {
     docker run --rm \
         -v "${config_dir}:/home/node/.claude" \
         -v "${xdg_config_dir}:/home/node/.config" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "echo 'test-config-data' > /home/node/.claude/test-config && echo 'xdg-test-data' > /home/node/.config/test-xdg"
 
     # Check if files exist on host
@@ -243,8 +270,6 @@ test_config_persistence() {
         info "Config files written to host successfully"
     else
         fail "Config files not written to host"
-        docker rmi "${image_name}" &> /dev/null || true
-        teardown
         return
     fi
 
@@ -254,7 +279,7 @@ test_config_persistence() {
     result=$(docker run --rm \
         -v "${config_dir}:/home/node/.claude" \
         -v "${xdg_config_dir}:/home/node/.config" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude/test-config && cat /home/node/.config/test-xdg" 2>&1)
 
     if echo "${result}" | grep -q "test-config-data" && echo "${result}" | grep -q "xdg-test-data"; then
@@ -262,10 +287,6 @@ test_config_persistence() {
     else
         fail "Configuration does not persist" "Got: ${result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: Entrypoint runs as root and switches to node
@@ -275,28 +296,22 @@ test_entrypoint_user_switch() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
-
-    local image_name
-    image_name=$(get_image_name)
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip "Entrypoint user switch (shared image not built)"
+        return
+    fi
 
     info "Testing entrypoint user switching..."
 
     # The entrypoint should start as root and switch to node
     local whoami_result
-    whoami_result=$(docker run --rm "${image_name}" whoami 2>&1)
+    whoami_result=$(docker run --rm "${SHARED_TEST_IMAGE}" whoami 2>&1)
 
     if echo "${whoami_result}" | grep -q "node"; then
         pass "Entrypoint correctly switches to node user"
     else
         fail "Entrypoint does not switch to node user" "Got: ${whoami_result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: Config directories have correct ownership in container
@@ -306,13 +321,13 @@ test_config_ownership() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip "Config ownership (shared image not built)"
+        return
+    fi
 
-    local image_name
-    image_name=$(get_image_name)
-    local config_dir="${HOME}/.ccc-claude-config"
+    local project_dir="${HOME}/.ccc/test-project"
+    local config_dir="${project_dir}/claude"
 
     mkdir -p "${config_dir}"
 
@@ -322,7 +337,7 @@ test_config_ownership() {
     local owner_result
     owner_result=$(docker run --rm \
         -v "${config_dir}:/home/node/.claude" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "ls -la /home/node/.claude && stat -c '%U:%G' /home/node/.claude" 2>&1)
 
     if echo "${owner_result}" | grep -q "node:node"; then
@@ -330,10 +345,6 @@ test_config_ownership() {
     else
         fail "Config directories have wrong ownership" "Got: ${owner_result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: Node user can write to config directories
@@ -343,15 +354,15 @@ test_node_can_write_config() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip "Node can write config (shared image not built)"
+        return
+    fi
 
-    local image_name
-    image_name=$(get_image_name)
-    local config_dir="${HOME}/.ccc-claude-config"
-    local xdg_config="${HOME}/.ccc-xdg-config"
-    local xdg_data="${HOME}/.ccc-xdg-data"
+    local project_dir="${HOME}/.ccc/test-project"
+    local config_dir="${project_dir}/claude"
+    local xdg_config="${project_dir}/xdg-config"
+    local xdg_data="${project_dir}/xdg-data"
 
     mkdir -p "${config_dir}" "${xdg_config}" "${xdg_data}"
 
@@ -363,7 +374,7 @@ test_node_can_write_config() {
         -v "${config_dir}:/home/node/.claude" \
         -v "${xdg_config}:/home/node/.config" \
         -v "${xdg_data}:/home/node/.local/share" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "
             touch /home/node/.claude/write-test && \
             touch /home/node/.config/write-test && \
@@ -376,10 +387,6 @@ test_node_can_write_config() {
     else
         fail "Node user cannot write to config directories" "Got: ${write_result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: Settings.json is auto-created with bypass permissions
@@ -389,13 +396,13 @@ test_settings_json_created() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip "Settings.json auto-creation (shared image not built)"
+        return
+    fi
 
-    local image_name
-    image_name=$(get_image_name)
-    local config_dir="${HOME}/.ccc-claude-config"
+    local project_dir="${HOME}/.ccc/test-project"
+    local config_dir="${project_dir}/claude"
 
     # Use a fresh config directory
     rm -rf "${config_dir}"
@@ -407,7 +414,7 @@ test_settings_json_created() {
     local result
     result=$(docker run --rm \
         -v "${config_dir}:/home/node/.claude" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude/settings.json" 2>&1)
 
     if echo "${result}" | grep -q "bypassPermissions"; then
@@ -415,10 +422,6 @@ test_settings_json_created() {
     else
         fail "Settings.json not created or missing bypassPermissions" "Got: ${result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: Settings.json persists across container restarts
@@ -428,13 +431,13 @@ test_settings_persistence() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip "Settings persistence (shared image not built)"
+        return
+    fi
 
-    local image_name
-    image_name=$(get_image_name)
-    local config_dir="${HOME}/.ccc-claude-config"
+    local project_dir="${HOME}/.ccc/test-project"
+    local config_dir="${project_dir}/claude"
 
     # Use a fresh config directory
     rm -rf "${config_dir}"
@@ -445,7 +448,7 @@ test_settings_persistence() {
     # Run first container to create settings
     docker run --rm \
         -v "${config_dir}:/home/node/.claude" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude/settings.json" &> /dev/null
 
     # Verify settings exist on host
@@ -453,8 +456,6 @@ test_settings_persistence() {
         info "Settings.json created on host"
     else
         fail "Settings.json not found on host after first container"
-        docker rmi "${image_name}" &> /dev/null || true
-        teardown
         return
     fi
 
@@ -462,7 +463,7 @@ test_settings_persistence() {
     local result
     result=$(docker run --rm \
         -v "${config_dir}:/home/node/.claude" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude/settings.json" 2>&1)
 
     if echo "${result}" | grep -q "bypassPermissions"; then
@@ -470,10 +471,6 @@ test_settings_persistence() {
     else
         fail "Settings.json not readable in second container" "Got: ${result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: .claude.json (theme/preferences) is auto-created
@@ -483,16 +480,17 @@ test_claude_json_created() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip ".claude.json auto-creation (shared image not built)"
+        return
+    fi
 
-    local image_name
-    image_name=$(get_image_name)
-    local claude_json="${HOME}/.ccc-claude.json"
+    local project_dir="${HOME}/.ccc/test-project"
+    local claude_json="${project_dir}/claude.json"
 
     # Use a fresh file
     rm -f "${claude_json}"
+    mkdir -p "${project_dir}"
     echo '{}' > "${claude_json}"
 
     info "Testing that .claude.json is auto-created with theme..."
@@ -501,7 +499,7 @@ test_claude_json_created() {
     local result
     result=$(docker run --rm \
         -v "${claude_json}:/home/node/.claude.json" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude.json" 2>&1)
 
     if echo "${result}" | grep -q "hasCompletedOnboarding"; then
@@ -509,10 +507,6 @@ test_claude_json_created() {
     else
         fail ".claude.json not created or missing onboarding flag" "Got: ${result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Test: .claude.json persists theme across container restarts
@@ -522,16 +516,17 @@ test_claude_json_persistence() {
         return
     fi
 
-    setup
-    "${CCC_BIN}" init &> /dev/null || true
-    "${CCC_BIN}" build &> /dev/null || true
+    if [[ -z "${SHARED_TEST_IMAGE}" ]]; then
+        skip ".claude.json persistence (shared image not built)"
+        return
+    fi
 
-    local image_name
-    image_name=$(get_image_name)
-    local claude_json="${HOME}/.ccc-claude.json"
+    local project_dir="${HOME}/.ccc/test-project"
+    local claude_json="${project_dir}/claude.json"
 
     # Use a fresh file
     rm -f "${claude_json}"
+    mkdir -p "${project_dir}"
     echo '{}' > "${claude_json}"
 
     info "Testing .claude.json persistence..."
@@ -539,7 +534,7 @@ test_claude_json_persistence() {
     # Run first container to create .claude.json
     docker run --rm \
         -v "${claude_json}:/home/node/.claude.json" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude.json" &> /dev/null
 
     # Verify file exists on host with content
@@ -547,8 +542,6 @@ test_claude_json_persistence() {
         info ".claude.json created on host with onboarding flag"
     else
         fail ".claude.json not found or missing content on host"
-        docker rmi "${image_name}" &> /dev/null || true
-        teardown
         return
     fi
 
@@ -556,7 +549,7 @@ test_claude_json_persistence() {
     local result
     result=$(docker run --rm \
         -v "${claude_json}:/home/node/.claude.json" \
-        "${image_name}" \
+        "${SHARED_TEST_IMAGE}" \
         /bin/bash -c "cat /home/node/.claude.json" 2>&1)
 
     if echo "${result}" | grep -q "hasCompletedOnboarding"; then
@@ -564,10 +557,6 @@ test_claude_json_persistence() {
     else
         fail ".claude.json not readable in second container" "Got: ${result}"
     fi
-
-    # Clean up
-    docker rmi "${image_name}" &> /dev/null || true
-    teardown
 }
 
 # Main test runner
@@ -588,9 +577,10 @@ run_tests() {
     test_dockerfile_installs_gosu
     test_config_directories_created
 
-    # Container tests (slower)
+    # Container tests (uses shared image for speed)
     echo ""
-    info "Running container integration tests (this may take a while)..."
+    info "Running container integration tests..."
+    info "Building shared test image once (this may take a few minutes on first run)..."
     echo ""
 
     test_build_image
@@ -602,6 +592,11 @@ run_tests() {
     test_claude_json_created
     test_claude_json_persistence
     test_config_persistence
+
+    # Cleanup shared test image
+    info "Cleaning up test image..."
+    cleanup_shared_test_image
+    teardown
 
     # Summary
     echo ""
