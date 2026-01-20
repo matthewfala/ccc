@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.2"
+CCC_VERSION="1.1.3"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
@@ -149,6 +149,14 @@ init_project() {
         print_info "init-firewall.sh already exists"
     fi
 
+    # Create entrypoint.sh if it doesn't exist
+    if [[ ! -f "${ccc_dir}/entrypoint.sh" ]]; then
+        create_entrypoint_script "${ccc_dir}/entrypoint.sh"
+        print_success "Created ${ccc_dir}/entrypoint.sh"
+    else
+        print_info "entrypoint.sh already exists"
+    fi
+
     # Create steering file
     if [[ ! -f "${ccc_dir}/CLAUDE.md" ]]; then
         create_steering_file "${ccc_dir}/CLAUDE.md" "${project_name}"
@@ -219,7 +227,7 @@ RUN install -m 0755 -d /etc/apt/keyrings && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin && \
+    apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin gosu && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
@@ -283,15 +291,18 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
 # Install Claude Code
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
-# Copy and set up firewall script
+# Copy and set up firewall script and entrypoint
 COPY init-firewall.sh /usr/local/bin/
+COPY entrypoint.sh /usr/local/bin/
 USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh && \
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh && \
     echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
-    echo "node ALL=(root) NOPASSWD: /usr/bin/docker, /usr/bin/docker-buildx" > /etc/sudoers.d/node-docker && \
+    echo "node ALL=(root) NOPASSWD: ALL" > /etc/sudoers.d/node-sudo && \
     chmod 0440 /etc/sudoers.d/node-firewall && \
-    chmod 0440 /etc/sudoers.d/node-docker
-USER node
+    chmod 0440 /etc/sudoers.d/node-sudo
+
+# Use entrypoint to fix docker socket permissions before switching to node user
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # Default command
 CMD ["claude", "--dangerously-skip-permissions"]
@@ -423,6 +434,24 @@ FIREWALL_SCRIPT
     chmod +x "${script_path}"
 }
 
+# Create entrypoint script that fixes docker socket permissions
+create_entrypoint_script() {
+    local script_path="$1"
+    cat > "${script_path}" << 'ENTRYPOINT_SCRIPT'
+#!/bin/bash
+set -e
+
+# Fix docker socket permissions if it exists
+if [ -S /var/run/docker.sock ]; then
+    chmod 666 /var/run/docker.sock 2>/dev/null || true
+fi
+
+# Switch to node user and execute the command
+exec gosu node "$@"
+ENTRYPOINT_SCRIPT
+    chmod +x "${script_path}"
+}
+
 # Create steering file for Claude Code
 create_steering_file() {
     local steering_path="$1"
@@ -456,7 +485,7 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 2. **Document changes**: Add comments explaining why each package is needed
 3. **Rebuild from within the container**: Use Docker-in-Docker to rebuild the image:
    \`\`\`bash
-   cd /sandbox/ccc && sudo docker build -t ccc-devcontainer-\$(basename /sandbox) -f Dockerfile.devcontainer .
+   cd /sandbox/ccc && docker build -t ccc-devcontainer-\$(basename /sandbox) -f Dockerfile.devcontainer .
    \`\`\`
 4. **If the build fails**: Fix the Dockerfile and try rebuilding again until successful
 
@@ -469,7 +498,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip && \\
     apt-get clean && rm -rf /var/lib/apt/lists/*
 \`\`\`
 
-Docker is available inside this container via Docker-in-Docker. Use \`sudo docker\` for all docker commands (passwordless sudo is configured).
+Docker is available inside this container via Docker-in-Docker. The docker socket permissions are automatically configured at container startup.
 
 ### Network Access
 - By default, network access is unrestricted

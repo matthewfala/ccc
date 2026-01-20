@@ -1,6 +1,6 @@
 # CCC - Claude Code Container
 
-**Version 1.1.2**
+**Version 1.1.3**
 
 A tool to run Claude Code in a sandboxed Docker container, restricting its access to only the current project directory.
 
