@@ -1,6 +1,6 @@
 # CCC - Claude Code Container
 
-**Version 1.1.6**
+**Version 1.1.7**
 
 A tool to run Claude Code in a sandboxed Docker container, restricting its access to only the current project directory.
 
@@ -145,6 +145,7 @@ Additionally, on your host machine:
 | `~/.ccc-nodejs-config` | `/home/node/.npm` | NPM cache |
 | `~/.ccc-xdg-config` | `/home/node/.config` | XDG config (Claude Code settings) |
 | `~/.ccc-xdg-data` | `/home/node/.local/share` | XDG data (Claude Code data) |
+| `~/.ccc-claude.json` | `/home/node/.claude.json` | Theme and preferences |
 | `/var/run/docker.sock` | `/var/run/docker.sock` | Docker-in-Docker |
 
 ## Customizing the Container

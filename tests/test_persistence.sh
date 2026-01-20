@@ -476,6 +476,100 @@ test_settings_persistence() {
     teardown
 }
 
+# Test: .claude.json (theme/preferences) is auto-created
+test_claude_json_created() {
+    if ! check_docker_available; then
+        skip ".claude.json auto-creation (Docker not available)"
+        return
+    fi
+
+    setup
+    "${CCC_BIN}" init &> /dev/null || true
+    "${CCC_BIN}" build &> /dev/null || true
+
+    local image_name
+    image_name=$(get_image_name)
+    local claude_json="${HOME}/.ccc-claude.json"
+
+    # Use a fresh file
+    rm -f "${claude_json}"
+    echo '{}' > "${claude_json}"
+
+    info "Testing that .claude.json is auto-created with theme..."
+
+    # Run container to trigger .claude.json creation
+    local result
+    result=$(docker run --rm \
+        -v "${claude_json}:/home/node/.claude.json" \
+        "${image_name}" \
+        /bin/bash -c "cat /home/node/.claude.json" 2>&1)
+
+    if echo "${result}" | grep -q "hasCompletedOnboarding"; then
+        pass ".claude.json is auto-created with onboarding flag"
+    else
+        fail ".claude.json not created or missing onboarding flag" "Got: ${result}"
+    fi
+
+    # Clean up
+    docker rmi "${image_name}" &> /dev/null || true
+    teardown
+}
+
+# Test: .claude.json persists theme across container restarts
+test_claude_json_persistence() {
+    if ! check_docker_available; then
+        skip ".claude.json persistence (Docker not available)"
+        return
+    fi
+
+    setup
+    "${CCC_BIN}" init &> /dev/null || true
+    "${CCC_BIN}" build &> /dev/null || true
+
+    local image_name
+    image_name=$(get_image_name)
+    local claude_json="${HOME}/.ccc-claude.json"
+
+    # Use a fresh file
+    rm -f "${claude_json}"
+    echo '{}' > "${claude_json}"
+
+    info "Testing .claude.json persistence..."
+
+    # Run first container to create .claude.json
+    docker run --rm \
+        -v "${claude_json}:/home/node/.claude.json" \
+        "${image_name}" \
+        /bin/bash -c "cat /home/node/.claude.json" &> /dev/null
+
+    # Verify file exists on host with content
+    if [[ -f "${claude_json}" ]] && grep -q "hasCompletedOnboarding" "${claude_json}"; then
+        info ".claude.json created on host with onboarding flag"
+    else
+        fail ".claude.json not found or missing content on host"
+        docker rmi "${image_name}" &> /dev/null || true
+        teardown
+        return
+    fi
+
+    # Run second container to verify .claude.json persists
+    local result
+    result=$(docker run --rm \
+        -v "${claude_json}:/home/node/.claude.json" \
+        "${image_name}" \
+        /bin/bash -c "cat /home/node/.claude.json" 2>&1)
+
+    if echo "${result}" | grep -q "hasCompletedOnboarding"; then
+        pass ".claude.json persists across container restarts"
+    else
+        fail ".claude.json not readable in second container" "Got: ${result}"
+    fi
+
+    # Clean up
+    docker rmi "${image_name}" &> /dev/null || true
+    teardown
+}
+
 # Main test runner
 run_tests() {
     echo ""
@@ -505,6 +599,8 @@ run_tests() {
     test_node_can_write_config
     test_settings_json_created
     test_settings_persistence
+    test_claude_json_created
+    test_claude_json_persistence
     test_config_persistence
 
     # Summary

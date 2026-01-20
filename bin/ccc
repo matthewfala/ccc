@@ -9,13 +9,14 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.6"
+CCC_VERSION="1.1.7"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
 CCC_CLAUDE_NODEJS_DIR="${HOME}/.ccc-nodejs-config"
 CCC_XDG_CONFIG_DIR="${HOME}/.ccc-xdg-config"
 CCC_XDG_DATA_DIR="${HOME}/.ccc-xdg-data"
+CCC_CLAUDE_JSON_FILE="${HOME}/.ccc-claude.json"
 
 # Colors for output (if terminal supports it)
 if [[ -t 1 ]]; then
@@ -451,6 +452,7 @@ chown -R node:node /home/node/.claude 2>/dev/null || true
 chown -R node:node /home/node/.config 2>/dev/null || true
 chown -R node:node /home/node/.local 2>/dev/null || true
 chown -R node:node /home/node/.npm 2>/dev/null || true
+chown node:node /home/node/.claude.json 2>/dev/null || true
 
 # Ensure the directories exist with correct permissions
 mkdir -p /home/node/.claude /home/node/.config /home/node/.local/share /home/node/.npm
@@ -469,6 +471,17 @@ if [ ! -f /home/node/.claude/settings.json ]; then
 }
 SETTINGS
     chown node:node /home/node/.claude/settings.json
+fi
+
+# Create default .claude.json with dark theme if it doesn't exist
+if [ ! -s /home/node/.claude.json ] || [ "$(cat /home/node/.claude.json)" = "{}" ]; then
+    cat > /home/node/.claude.json << 'CLAUDEJSON'
+{
+  "theme": "dark",
+  "hasCompletedOnboarding": true
+}
+CLAUDEJSON
+    chown node:node /home/node/.claude.json
 fi
 
 # Switch to node user and execute the command
@@ -664,6 +677,11 @@ run_container() {
     mkdir -p "${CCC_XDG_CONFIG_DIR}"
     mkdir -p "${CCC_XDG_DATA_DIR}"
 
+    # Ensure .claude.json file exists (stores theme and other preferences)
+    if [[ ! -f "${CCC_CLAUDE_JSON_FILE}" ]]; then
+        echo '{}' > "${CCC_CLAUDE_JSON_FILE}"
+    fi
+
     # Ensure steering file exists at project root for Claude to read on startup
     ensure_steering_file_at_root
 
@@ -689,6 +707,7 @@ run_container() {
         -v "${CCC_CLAUDE_NODEJS_DIR}:/home/node/.npm"
         -v "${CCC_XDG_CONFIG_DIR}:/home/node/.config"
         -v "${CCC_XDG_DATA_DIR}:/home/node/.local/share"
+        -v "${CCC_CLAUDE_JSON_FILE}:/home/node/.claude.json"
         -v "/var/run/docker.sock:/var/run/docker.sock"
         -w /sandbox
     )
