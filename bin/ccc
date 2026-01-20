@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.4"
+CCC_VERSION="1.1.5"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_SECRETS_BASE="${HOME}/Sandbox/ccc-secrets"
 CCC_CLAUDE_CONFIG_DIR="${HOME}/.ccc-claude-config"
@@ -446,6 +446,16 @@ if [ -S /var/run/docker.sock ]; then
     chmod 666 /var/run/docker.sock 2>/dev/null || true
 fi
 
+# Fix ownership of mounted config directories so node user can write to them
+chown -R node:node /home/node/.claude 2>/dev/null || true
+chown -R node:node /home/node/.config 2>/dev/null || true
+chown -R node:node /home/node/.local 2>/dev/null || true
+chown -R node:node /home/node/.npm 2>/dev/null || true
+
+# Ensure the directories exist with correct permissions
+mkdir -p /home/node/.claude /home/node/.config /home/node/.local/share /home/node/.npm
+chown -R node:node /home/node/.claude /home/node/.config /home/node/.local /home/node/.npm
+
 # Switch to node user and execute the command
 exec gosu node "$@"
 ENTRYPOINT_SCRIPT
@@ -565,11 +575,8 @@ ensure_ccc_files() {
     local project_name
     project_name=$(get_project_name)
 
-    # Ensure entrypoint.sh exists (added in v1.1.3)
-    if [[ ! -f "${ccc_dir}/entrypoint.sh" ]]; then
-        create_entrypoint_script "${ccc_dir}/entrypoint.sh"
-        print_info "Created missing ${ccc_dir}/entrypoint.sh"
-    fi
+    # Always update entrypoint.sh to get latest fixes (small generated file)
+    create_entrypoint_script "${ccc_dir}/entrypoint.sh"
 
     # Ensure init-firewall.sh exists
     if [[ ! -f "${ccc_dir}/init-firewall.sh" ]]; then
