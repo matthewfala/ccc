@@ -41,7 +41,7 @@ source ~/.zshrc
 ```bash
 # Download the script
 mkdir -p ~/bin
-curl -o ~/bin/ccc https://raw.githubusercontent.com/your-username/ccc/main/bin/ccc
+curl -o ~/bin/ccc https://raw.githubusercontent.com/matthewfala/ccc/main/bin/ccc
 chmod +x ~/bin/ccc
 
 # Add to PATH if not already
@@ -53,7 +53,7 @@ source ~/.zshrc
 
 ```bash
 # Requires sudo
-sudo curl -o /usr/local/bin/ccc https://raw.githubusercontent.com/your-username/ccc/main/bin/ccc
+sudo curl -o /usr/local/bin/ccc https://raw.githubusercontent.com/matthewfala/ccc/main/bin/ccc
 sudo chmod +x /usr/local/bin/ccc
 ```
 
@@ -62,9 +62,6 @@ sudo chmod +x /usr/local/bin/ccc
 ```bash
 # Navigate to your project directory
 cd ~/projects/my-project
-
-# Initialize ccc (creates /ccc folder with Dockerfile)
-ccc init
 
 # Start Claude Code in container
 ccc
@@ -280,7 +277,3 @@ Each project maintains its own authentication, so you may need to authenticate o
 matthewfala@gmail.com
 
 **All Rights Reserved**
-
----
-
-For more information about Claude Code, visit: https://code.claude.ai/docs
