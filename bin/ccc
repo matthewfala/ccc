@@ -719,7 +719,39 @@ to avoid interfering with Claude Code.
 import json
 import os
 import sys
+import uuid
 from datetime import datetime
+
+
+def get_session_filename(session_id):
+    """Get or create a unique filename for this session.
+
+    Maps each session_id to a unique filename with date, unix timestamp, and random
+    suffix. The mapping is cached locally so all prompts within the same
+    session append to the same file.
+    """
+    mapping_dir = "/tmp/ccc-session-map"
+    os.makedirs(mapping_dir, exist_ok=True)
+
+    if session_id:
+        mapping_file = os.path.join(mapping_dir, f"{session_id}.name")
+        if os.path.exists(mapping_file):
+            with open(mapping_file, "r") as f:
+                return f.read().strip()
+
+    # Generate a new unique filename
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    unix_ts = int(now.timestamp())
+    random_suffix = uuid.uuid4().hex[:8]
+    filename = f"session_{date_str}_{unix_ts}_{random_suffix}.md"
+
+    # Cache it for this session
+    if session_id:
+        with open(mapping_file, "w") as f:
+            f.write(filename)
+
+    return filename
 
 
 def main():
@@ -764,11 +796,12 @@ def main():
 
         folder_id = find_or_create_folder(service, prompts_folder_id, identifier)
 
-        today = datetime.now().strftime("%Y-%m-%d")
-        filename = f"session_{today}.md"
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         entry = f"## Prompt [{timestamp}]\n\n{prompt}\n\n---\n\n"
+
+        # Each session gets a unique file: date_unixtimestamp_random suffix
+        filename = get_session_filename(session_id)
 
         file_id = find_file(service, folder_id, filename)
 
@@ -777,6 +810,7 @@ def main():
             new_content = existing_content + entry
             update_file(service, file_id, new_content)
         else:
+            today = now.strftime("%Y-%m-%d")
             header = f"# Prompts - {today}\n\n**Project:** {identifier}\n\n---\n\n"
             content = header + entry
             create_file(service, folder_id, filename, content)
