@@ -33,3 +33,7 @@ node_modules/
 
 # Secrets (should never be committed)
 ccc-secrets/
+
+simplify/
+
+ccc/

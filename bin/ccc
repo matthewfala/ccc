@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Configuration
-CCC_VERSION="1.1.8"
+CCC_VERSION="1.1.9"
 CCC_IMAGE_PREFIX="ccc-devcontainer"
 CCC_BASE_DIR="${HOME}/.ccc"
 
@@ -83,26 +83,61 @@ get_project_name() {
     basename "$(pwd)"
 }
 
+# Get or generate a unique CCC identifier for this project
+# Format: <folder-name>-<8-char-hex>
+# Persisted in ./ccc/.ccc-id
+get_ccc_identifier() {
+    local id_file="./ccc/.ccc-id"
+    if [[ -f "${id_file}" ]]; then
+        local existing
+        existing=$(cat "${id_file}")
+        # Validate: must end with 8 hex chars (not a bare trailing dash)
+        if [[ "${existing}" =~ -[0-9a-f]{8}$ ]]; then
+            echo "${existing}"
+            return
+        fi
+        # Invalid identifier from a previous buggy run — regenerate
+        rm -f "${id_file}"
+    fi
+
+    local folder_name
+    folder_name=$(basename "$(pwd)")
+    local hash_input
+    hash_input="$(pwd)-$(date +%s)-$$"
+    local hash
+    if command -v sha256sum &> /dev/null; then
+        hash=$(printf '%s' "${hash_input}" | sha256sum | head -c 8)
+    else
+        hash=$(printf '%s' "${hash_input}" | shasum -a 256 | head -c 8)
+    fi
+    local identifier="${folder_name}-${hash}"
+
+    # Ensure ccc directory exists before writing
+    mkdir -p "./ccc"
+    echo "${identifier}" > "${id_file}"
+    echo "${identifier}"
+}
+
 # Get image name for current project
 get_image_name() {
-    local project_name
-    project_name=$(get_project_name)
-    echo "${CCC_IMAGE_PREFIX}-${project_name}"
+    local identifier
+    identifier=$(get_ccc_identifier)
+    echo "${CCC_IMAGE_PREFIX}-${identifier}"
 }
 
 # Get container name for current project
 get_container_name() {
-    local project_name
-    project_name=$(get_project_name)
-    echo "ccc-${project_name}"
+    local identifier
+    identifier=$(get_ccc_identifier)
+    echo "ccc-${identifier}"
 }
 
 # Get project-specific paths for persistence
-# All project data is now stored under ~/.ccc/<project>/
+# All project data is now stored under ~/.ccc/<identifier>/
 get_project_paths() {
-    local project_name
-    project_name=$(get_project_name)
-    local project_dir="${CCC_BASE_DIR}/${project_name}"
+    local identifier
+    identifier=$(get_ccc_identifier)
+    local project_dir="${CCC_BASE_DIR}/${identifier}"
 
     # Export all paths for use by calling function
     CCC_PROJECT_DIR="${project_dir}"
@@ -111,6 +146,7 @@ get_project_paths() {
     CCC_XDG_DATA_DIR="${project_dir}/xdg-data"
     CCC_CLAUDE_JSON_FILE="${project_dir}/claude.json"
     CCC_SECRETS_DIR="${project_dir}/sandbox-secrets"
+    CCC_CONFIG_DIR="${project_dir}/configuration"
 }
 
 # Migrate data from old global paths to new project-specific paths (v1.1.7 -> v1.1.8)
@@ -207,9 +243,6 @@ init_project() {
     project_name=$(get_project_name)
     local ccc_dir="./ccc"
 
-    # Get project-specific paths
-    get_project_paths
-
     print_info "Initializing ccc for project: ${project_name}"
 
     # Create ccc directory
@@ -219,6 +252,14 @@ init_project() {
     else
         print_info "${ccc_dir} directory already exists"
     fi
+
+    # Generate and persist the unique identifier
+    local identifier
+    identifier=$(get_ccc_identifier)
+    print_success "Project identifier: ${identifier}"
+
+    # Get project-specific paths (uses identifier)
+    get_project_paths
 
     # Create Dockerfile.devcontainer if it doesn't exist
     if [[ ! -f "${ccc_dir}/Dockerfile.devcontainer" ]]; then
@@ -244,9 +285,17 @@ init_project() {
         print_info "entrypoint.sh already exists"
     fi
 
+    # Create prompt capture hook scripts if they don't exist
+    if [[ ! -f "${ccc_dir}/ccc-store-prompt.sh" ]] || [[ ! -f "${ccc_dir}/ccc-store-prompt.py" ]]; then
+        create_store_prompt_scripts "${ccc_dir}"
+        print_success "Created prompt capture hook scripts"
+    else
+        print_info "Hook scripts already exist"
+    fi
+
     # Create steering file
     if [[ ! -f "${ccc_dir}/CLAUDE.md" ]]; then
-        create_steering_file "${ccc_dir}/CLAUDE.md" "${project_name}"
+        create_steering_file "${ccc_dir}/CLAUDE.md" "${identifier}"
         print_success "Created ${ccc_dir}/CLAUDE.md steering file"
     else
         print_info "CLAUDE.md steering file already exists"
@@ -268,12 +317,24 @@ init_project() {
         print_info "Secrets directory already exists: ${CCC_SECRETS_DIR}"
     fi
 
+    # Create configuration directory
+    if [[ ! -d "${CCC_CONFIG_DIR}" ]]; then
+        mkdir -p "${CCC_CONFIG_DIR}"
+        print_success "Created configuration directory: ${CCC_CONFIG_DIR}"
+    else
+        print_info "Configuration directory already exists: ${CCC_CONFIG_DIR}"
+    fi
+
+    # Create default project-config.json if it doesn't exist
+    ensure_project_config "${project_name}" "${identifier}"
+
     # Create .gitignore if not exists
     if [[ ! -f "${ccc_dir}/.gitignore" ]]; then
         cat > "${ccc_dir}/.gitignore" << 'GITIGNORE'
 # CCC local files
 *.local
 .env
+.ccc-id
 GITIGNORE
         print_success "Created ${ccc_dir}/.gitignore"
     fi
@@ -324,6 +385,15 @@ RUN install -m 0755 -d /etc/apt/keyrings && \
     apt-get update && \
     apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin gosu && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Python for Google Drive prompt upload hook
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Google Drive API client
+RUN pip3 install --no-cache-dir --break-system-packages \
+    google-auth google-api-python-client
 
 # Ensure default node user has access to /usr/local/share
 RUN mkdir -p /usr/local/share/npm-global && \
@@ -386,11 +456,14 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
 # Install Claude Code
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
-# Copy and set up firewall script and entrypoint
+# Copy and set up firewall script, entrypoint, and hook scripts
 COPY init-firewall.sh /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/
+COPY ccc-store-prompt.sh /usr/local/bin/
+COPY ccc-store-prompt.py /usr/local/bin/
 USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh && \
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
+    /usr/local/bin/ccc-store-prompt.sh /usr/local/bin/ccc-store-prompt.py && \
     echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
     echo "node ALL=(root) NOPASSWD: ALL" > /etc/sudoers.d/node-sudo && \
     chmod 0440 /etc/sudoers.d/node-firewall && \
@@ -578,16 +651,219 @@ CLAUDEJSON
     chown node:node /home/node/.claude.json
 fi
 
+# Inject prompt capture hook if Google Drive is enabled
+if [ -f /config/project-config.json ]; then
+    DRIVE_ENABLED=$(jq -r '.googleDrive.enabled // false' /config/project-config.json 2>/dev/null)
+    if [ "$DRIVE_ENABLED" = "true" ]; then
+        # Add UserPromptSubmit hook to settings.json
+        SETTINGS_FILE="/home/node/.claude/settings.json"
+        if [ -f "$SETTINGS_FILE" ]; then
+            jq '.hooks = (.hooks // {}) | .hooks.UserPromptSubmit = [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/usr/local/bin/ccc-store-prompt.sh"
+                }]
+            }]' "$SETTINGS_FILE" > /tmp/settings.tmp && mv /tmp/settings.tmp "$SETTINGS_FILE"
+            chown node:node "$SETTINGS_FILE"
+        fi
+    fi
+fi
+
 # Switch to node user and execute the command
 exec gosu node "$@"
 ENTRYPOINT_SCRIPT
     chmod +x "${script_path}"
 }
 
+# Create prompt capture hook scripts
+create_store_prompt_scripts() {
+    local ccc_dir="$1"
+
+    # Shell wrapper
+    cat > "${ccc_dir}/ccc-store-prompt.sh" << 'HOOK_SHELL'
+#!/bin/bash
+# Hook: UserPromptSubmit
+# Reads JSON from stdin, extracts prompt, uploads to Google Drive asynchronously.
+# Must exit 0 immediately to avoid blocking Claude.
+
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty')
+
+if [[ -z "$PROMPT" ]]; then
+    exit 0
+fi
+
+# Run upload in background -- do not block Claude
+/usr/local/bin/ccc-store-prompt.py "$SESSION_ID" <<< "$PROMPT" &
+
+exit 0
+HOOK_SHELL
+    chmod +x "${ccc_dir}/ccc-store-prompt.sh"
+
+    # Python uploader
+    cat > "${ccc_dir}/ccc-store-prompt.py" << 'HOOK_PYTHON'
+#!/usr/bin/env python3
+"""
+CCC Prompt Capture - Google Drive Uploader
+
+Reads a prompt from stdin and appends it to a session markdown file
+in Google Drive. Uses service account authentication.
+
+Usage: ccc-store-prompt.py <session_id> <<< "prompt text"
+
+All errors are caught and logged to stderr. Never exits non-zero
+to avoid interfering with Claude Code.
+"""
+
+import json
+import os
+import sys
+from datetime import datetime
+
+
+def main():
+    try:
+        session_id = sys.argv[1] if len(sys.argv) > 1 else ""
+        prompt = sys.stdin.read().strip()
+
+        if not prompt:
+            sys.exit(0)
+
+        config_path = "/config/project-config.json"
+        if not os.path.exists(config_path):
+            sys.exit(0)
+
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        drive_config = config.get("googleDrive", {})
+        if not drive_config.get("enabled", False):
+            sys.exit(0)
+
+        credentials_path = drive_config.get("credentialsPath", "")
+        prompts_folder_id = drive_config.get("promptsFolderId", "")
+        identifier = config.get("cccIdentifier", "unknown")
+
+        if not credentials_path or not prompts_folder_id:
+            sys.exit(0)
+
+        if not os.path.exists(credentials_path):
+            print(f"Warning: credentials file not found: {credentials_path}", file=sys.stderr)
+            sys.exit(0)
+
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaInMemoryUpload
+
+        SCOPES = ["https://www.googleapis.com/auth/drive"]
+        creds = service_account.Credentials.from_service_account_file(
+            credentials_path, scopes=SCOPES
+        )
+        service = build("drive", "v3", credentials=creds)
+
+        folder_id = find_or_create_folder(service, prompts_folder_id, identifier)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        filename = f"session_{today}.md"
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"## Prompt [{timestamp}]\n\n{prompt}\n\n---\n\n"
+
+        file_id = find_file(service, folder_id, filename)
+
+        if file_id:
+            existing_content = download_file_content(service, file_id)
+            new_content = existing_content + entry
+            update_file(service, file_id, new_content)
+        else:
+            header = f"# Prompts - {today}\n\n**Project:** {identifier}\n\n---\n\n"
+            content = header + entry
+            create_file(service, folder_id, filename, content)
+
+    except Exception as e:
+        print(f"ccc-store-prompt error: {e}", file=sys.stderr)
+        sys.exit(0)
+
+
+def find_or_create_folder(service, parent_id, folder_name):
+    query = (
+        f"name = '{folder_name}' and '{parent_id}' in parents "
+        f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    results = service.files().list(
+        q=query, spaces="drive", fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+    file_metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(
+        body=file_metadata, fields="id", supportsAllDrives=True
+    ).execute()
+    return folder["id"]
+
+
+def find_file(service, folder_id, filename):
+    query = (
+        f"name = '{filename}' and '{folder_id}' in parents "
+        f"and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    results = service.files().list(
+        q=query, spaces="drive", fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
+    files = results.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def download_file_content(service, file_id):
+    content = service.files().get_media(
+        fileId=file_id, supportsAllDrives=True
+    ).execute()
+    return content.decode("utf-8") if isinstance(content, bytes) else content
+
+
+def update_file(service, file_id, content):
+    from googleapiclient.http import MediaInMemoryUpload
+    media = MediaInMemoryUpload(
+        content.encode("utf-8"), mimetype="text/markdown"
+    )
+    service.files().update(
+        fileId=file_id, media_body=media, supportsAllDrives=True
+    ).execute()
+
+
+def create_file(service, folder_id, filename, content):
+    from googleapiclient.http import MediaInMemoryUpload
+    file_metadata = {
+        "name": filename,
+        "parents": [folder_id],
+    }
+    media = MediaInMemoryUpload(
+        content.encode("utf-8"), mimetype="text/markdown"
+    )
+    service.files().create(
+        body=file_metadata, media_body=media, fields="id",
+        supportsAllDrives=True
+    ).execute()
+
+
+if __name__ == "__main__":
+    main()
+HOOK_PYTHON
+    chmod +x "${ccc_dir}/ccc-store-prompt.py"
+}
+
 # Create steering file for Claude Code
 create_steering_file() {
     local steering_path="$1"
-    local project_name="$2"
+    local identifier="$2"
     cat > "${steering_path}" << STEERING
 # Claude Code Container Steering File
 
@@ -607,7 +883,13 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 - A secrets directory is mounted at \`/secrets\` for storing sensitive data
 - Use \`/secrets\` for API keys, credentials, and other sensitive information that should NOT be committed to git
 - The secrets directory persists between container restarts
-- Location on host: \`~/.ccc/${project_name}/sandbox-secrets\`
+- Location on host: \`~/.ccc/${identifier}/sandbox-secrets\`
+
+### Configuration
+- A read-only configuration directory is mounted at \`/config\`
+- Contains \`project-config.json\` with Google Drive integration settings
+- Contains \`drive-credentials.json\` for Google service account (if configured)
+- To modify configuration, edit files on the host at: \`~/.ccc/${identifier}/configuration/\`
 
 ### Container OS Changes (Docker-in-Docker) - AUTOMATIC PERSISTENCE
 
@@ -617,7 +899,7 @@ Your workspace is mounted at \`/sandbox\` which corresponds to the host's projec
 2. **Document changes**: Add comments explaining why each package is needed
 3. **Rebuild from within the container**: Use Docker-in-Docker to rebuild the image:
    \`\`\`bash
-   cd /sandbox/ccc && docker build -t ${CCC_IMAGE_PREFIX}-${project_name} -f Dockerfile.devcontainer .
+   cd /sandbox/ccc && docker build -t ${CCC_IMAGE_PREFIX}-${identifier} -f Dockerfile.devcontainer .
    \`\`\`
 4. **If the build fails**: Fix the Dockerfile and try rebuilding again until successful
 
@@ -655,14 +937,39 @@ Docker is available inside this container via Docker-in-Docker. The docker socke
 │   └── CLAUDE.md                # This steering file
 ├── [your project files]
 /secrets/                    # Persistent secrets storage (mounted)
+/config/                     # Read-only configuration (mounted)
+│   ├── project-config.json      # Project and Drive settings
+│   └── drive-credentials.json   # Google service account key (if configured)
 \`\`\`
 STEERING
 }
 
+# Ensure project-config.json exists with defaults
+ensure_project_config() {
+    local project_name="$1"
+    local identifier="$2"
+
+    if [[ ! -f "${CCC_CONFIG_DIR}/project-config.json" ]]; then
+        cat > "${CCC_CONFIG_DIR}/project-config.json" << CONFIGEOF
+{
+  "projectName": "${project_name}",
+  "cccIdentifier": "${identifier}",
+  "googleDrive": {
+    "enabled": false,
+    "credentialsPath": "/config/drive-credentials.json",
+    "documentsFolderId": "",
+    "promptsFolderId": ""
+  }
+}
+CONFIGEOF
+        print_success "Created default project-config.json"
+    fi
+}
+
 # Ensure steering file exists at project root for Claude to read
 ensure_steering_file_at_root() {
-    local project_name
-    project_name=$(get_project_name)
+    local identifier
+    identifier=$(get_ccc_identifier)
     local ccc_dir="./ccc"
     local root_steering_file="./CLAUDE.md"
     local ccc_steering_file="${ccc_dir}/CLAUDE.md"
@@ -670,7 +977,7 @@ ensure_steering_file_at_root() {
     # If CCC steering file doesn't exist, create it
     if [[ ! -f "${ccc_steering_file}" ]]; then
         mkdir -p "${ccc_dir}"
-        create_steering_file "${ccc_steering_file}" "${project_name}"
+        create_steering_file "${ccc_steering_file}" "${identifier}"
     fi
 
     # Create/update symlink or copy at project root if it doesn't exist or is outdated
@@ -694,8 +1001,8 @@ ensure_steering_file_at_root() {
 # Ensure all required ccc files exist (for upgrades from older versions)
 ensure_ccc_files() {
     local ccc_dir="./ccc"
-    local project_name
-    project_name=$(get_project_name)
+    local identifier
+    identifier=$(get_ccc_identifier)
 
     # Always update entrypoint.sh to get latest fixes (small generated file)
     create_entrypoint_script "${ccc_dir}/entrypoint.sh"
@@ -705,6 +1012,15 @@ ensure_ccc_files() {
         create_init_firewall_script "${ccc_dir}/init-firewall.sh"
         print_info "Created missing ${ccc_dir}/init-firewall.sh"
     fi
+
+    # Ensure Dockerfile.devcontainer exists
+    if [[ ! -f "${ccc_dir}/Dockerfile.devcontainer" ]]; then
+        create_default_dockerfile "${ccc_dir}/Dockerfile.devcontainer"
+        print_info "Created missing ${ccc_dir}/Dockerfile.devcontainer"
+    fi
+
+    # Always update hook scripts to get latest fixes (small generated files)
+    create_store_prompt_scripts "${ccc_dir}"
 }
 
 # Build Docker image
@@ -757,6 +1073,10 @@ run_container() {
     # Get project-specific paths
     get_project_paths
 
+    # Get the identifier for the banner
+    local identifier
+    identifier=$(get_ccc_identifier)
+
     # Ensure image is built
     build_image "false"
 
@@ -765,6 +1085,10 @@ run_container() {
 
     # Ensure secrets directory exists
     mkdir -p "${CCC_SECRETS_DIR}"
+
+    # Ensure configuration directory exists with default config
+    mkdir -p "${CCC_CONFIG_DIR}"
+    ensure_project_config "${project_name}" "${identifier}"
 
     # Ensure Claude config directory exists
     mkdir -p "${CCC_CLAUDE_CONFIG_DIR}"
@@ -786,13 +1110,14 @@ run_container() {
 
     # Display version on startup
     echo ""
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC}       ${GREEN}Claude Code Container (ccc) v${CCC_VERSION}${NC}               ${BLUE}║${NC}"
-    echo -e "${BLUE}║${NC}       Project: ${YELLOW}${project_name}${NC}                              ${BLUE}║${NC}"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}       ${GREEN}Claude Code Container (ccc) v${CCC_VERSION}${NC}                   ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}       Project: ${YELLOW}${project_name}${NC}                                      ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}       ID: ${YELLOW}${identifier}${NC}                                              ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    print_info "Starting Claude Code Container for: ${project_name}"
+    print_info "Starting Claude Code Container for: ${project_name} (${identifier})"
 
     # Build docker run command
     # Note: Node.js config (.npm) is NOT persisted - only Claude-related data
@@ -807,6 +1132,7 @@ run_container() {
         -v "${CCC_XDG_CONFIG_DIR}:/home/node/.config"
         -v "${CCC_XDG_DATA_DIR}:/home/node/.local/share"
         -v "${CCC_CLAUDE_JSON_FILE}:/home/node/.claude.json"
+        -v "${CCC_CONFIG_DIR}:/config:ro"
         -v "/var/run/docker.sock:/var/run/docker.sock"
         -w /sandbox
     )
@@ -845,6 +1171,8 @@ run_container() {
 show_status() {
     local project_name
     project_name=$(get_project_name)
+    local identifier
+    identifier=$(get_ccc_identifier)
     local image_name
     image_name=$(get_image_name)
     local container_name
@@ -854,7 +1182,7 @@ show_status() {
     # Get project-specific paths
     get_project_paths
 
-    echo "=== CCC Status for: ${project_name} ==="
+    echo "=== CCC Status for: ${project_name} (${identifier}) ==="
     echo ""
 
     # Check initialization
@@ -863,6 +1191,9 @@ show_status() {
     else
         print_warning "Project not initialized. Run 'ccc init'"
     fi
+
+    # Show identifier
+    print_info "Identifier: ${identifier}"
 
     # Check Dockerfile
     if [[ -f "${ccc_dir}/Dockerfile.devcontainer" ]]; then
@@ -903,6 +1234,22 @@ show_status() {
         print_info "Secrets directory not created: ${CCC_SECRETS_DIR}"
     fi
 
+    # Check configuration directory and Drive status
+    if [[ -d "${CCC_CONFIG_DIR}" ]]; then
+        print_success "Configuration directory: ${CCC_CONFIG_DIR}"
+        if [[ -f "${CCC_CONFIG_DIR}/project-config.json" ]]; then
+            local drive_enabled
+            drive_enabled=$(jq -r '.googleDrive.enabled // false' "${CCC_CONFIG_DIR}/project-config.json" 2>/dev/null || echo "false")
+            if [[ "${drive_enabled}" == "true" ]]; then
+                print_success "Google Drive integration: enabled"
+            else
+                print_info "Google Drive integration: disabled"
+            fi
+        fi
+    else
+        print_info "Configuration directory not created: ${CCC_CONFIG_DIR}"
+    fi
+
     echo ""
 }
 
@@ -910,12 +1257,14 @@ show_status() {
 clean_project() {
     local project_name
     project_name=$(get_project_name)
+    local identifier
+    identifier=$(get_ccc_identifier)
     local image_name
     image_name=$(get_image_name)
     local container_name
     container_name=$(get_container_name)
 
-    print_info "Cleaning up resources for: ${project_name}"
+    print_info "Cleaning up resources for: ${project_name} (${identifier})"
 
     # Stop container if running
     if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
